@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-animaturbo"
+description = "Anima/cosmos-predict2 int8 inference speedups for ComfyUI: fused self-attn QKV, faster SageAttention dispatch, and redundant-activation-quantize elimination for plain and ConvRot int8 Linears, plus a standalone (fork-free) warp-FHT ConvRot quantize kernel."
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/TheLegendOfKitty/ComfyUI-AnimaTurbo"
+
+[tool.comfy]
+PublisherId = "TheLegendOfKitty"
+DisplayName = "ComfyUI-AnimaTurbo"
+Icon = ""

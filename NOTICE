@@ -1,0 +1,22 @@
+ComfyUI-AnimaTurbo
+
+Copyright 2026 TheLegendOfKitty
+
+This distribution includes one file derived from comfy-kitchen:
+
+--------------------------------------------------------------------------------
+comfy-kitchen
+--------------------------------------------------------------------------------
+Copyright (c) 2025 Comfy Org. All rights reserved.
+License: Apache License, Version 2.0
+Website: https://github.com/Comfy-Org/comfy-kitchen
+
+warp_fht/convrot_warp_quantize.cu is extracted from comfy-kitchen's
+quantize_int8_rowwise_convrot_warp_kernel (comfy_kitchen/backends/cuda/ops/int8_linear.cu)
+and reproduces its warp-per-group fast Hadamard transform ConvRot row-wise INT8
+quantize kernel as a standalone CUDA extension, so it can run without a
+comfy-kitchen source fork.
+
+================================================================================
+
+For the full Apache License, Version 2.0 text, see LICENSE in this repository.
