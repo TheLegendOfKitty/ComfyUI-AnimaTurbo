@@ -12,12 +12,12 @@ a clone, so sibling clones (and the original) are unaffected. Skips a block
 if its q/k/v are not identically-shaped, identically-parameterized weights
 all in the same supported layout (TensorWiseINT8Layout or
 TensorCoreConvRotW4A4Layout), if a LoRA/patch targets any of them, or if it
-is already fused. q_proj/k_proj/
-v_proj stay registered on the replacement (unused by the fused compute_qkv)
-so whole-model device moves keep them in lockstep with the rest of the block;
-as a result a fused model's state_dict emits qkv_proj.* keys ALONGSIDE the
-original q_proj/k_proj/v_proj.* keys, and round-trips through the stock
-loader, which reports the extra qkv_proj.* keys as unexpected.
+is already fused. q_proj/k_proj/v_proj stay registered on the replacement
+(unused by the fused compute_qkv) so whole-model device moves keep them in
+lockstep with the rest of the block; as a result a fused model's state_dict
+emits qkv_proj.* keys ALONGSIDE the original q_proj/k_proj/v_proj.* keys,
+and round-trips through the stock loader, which reports the extra
+qkv_proj.* keys as unexpected.
 """
 import dataclasses
 import logging

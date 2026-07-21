@@ -263,12 +263,10 @@ void launch_for_rows_per_block(
 // ---------------------------------------------------------------------------
 // INT4 addition below: same namespace, reuses kConvRotGroup/kThreadsPerWarp/
 // to_float/from_float/finite_max_for_dtype/convrot_warp_h4_combine/convrot_warp_fht4
-// declared above unchanged. Extracted from comfy-kitchen's
-// quantize_int4_rowwise_convrot64_kernel (K%256==0 non-PACK4, non-OUTPUT_INT8
-// instantiation; comfy_kitchen/backends/cuda/ops/convrot_w4a4.cu), as a drop-in for
-// comfy_kitchen.backends.cuda._C.quantize_int4_rowwise_convrot64 on the shapes it
-// covers. Shares the group/element layout and butterfly stage structure above; only
-// the final quantize stage and output packing differ from the int8 kernel.
+// declared above unchanged. Warp-per-group design shared with the int8 kernel above;
+// only the final quantize (scale = absmax/7, clamp [-7,7]) and 2-per-byte int4 pack
+// stages differ. Output matches quantize_int4_rowwise_convrot64_kernel (group_size
+// 256) bitwise; stock has no warp-per-group int4 kernel.
 //
 // Invariants:
 //   - fp32 input reuses convrot_warp_h4_combine/convrot_warp_fht4 above unchanged:
