@@ -99,8 +99,11 @@ For `anima-base-v1.0-w4a4convrot.safetensors` (same config, `TorchCompileModel`
 |---|---|---|
 | Eager (no TorchCompileModel) | 0.6364 s/it | steady-state, last 20 of 30 steps |
 | Compiled (with `w4a4_compile_patch.py`) | **0.5880 s/it** | steady-state, last 20 of 30 steps |
+| Compiled + AnimaFuseQKV | **0.5770 s/it** | steady-state, last 20 of 30 steps |
 | Remaining graph breaks | 4 distinct reasons, 26 occurrences, **none in the ConvRot W4A4 linear/mm/addmm path** | `torch._dynamo.utils.counters`; all from SageAttention's pybind kernels and a `torch.cuda.set_device` dynamo skip-list entry, pre-existing and unrelated to this patch |
-| Peak VRAM (torch allocator) | 3567.8 MiB eager -> 3423.9 MiB compiled | 30 steps |
+| Remaining graph breaks, compiled + AnimaFuseQKV | same 4 distinct reasons, 26 occurrences -- **zero new/attributable to the fusion** | `torch._dynamo.utils.counters`, checked block-by-block against the unfused row above |
+| AnimaFuseQKV: `anima_turbo::convrot_w4a4_linear` calls/step at K=2048 | 196 -> 140 (**-56 calls/step**), 28 of which are the fused qkv_proj at N=6144 | compiled graph, 28-block DiT, `record_shapes=True` profiler pass |
+| Peak VRAM (torch allocator) | 3567.8 MiB eager -> 3423.9 MiB compiled -> 3592.5 MiB compiled + AnimaFuseQKV | 30 steps |
 
 ## Env kill-switches
 

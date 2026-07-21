@@ -9,8 +9,10 @@ this node AFTER any LoRA loaders and BEFORE TorchCompileModel -- LoRAs added
 downstream of this node will not affect the fused q/k/v. Never mutates the
 shared model: the replacement self_attn is installed via add_object_patch on
 a clone, so sibling clones (and the original) are unaffected. Skips a block
-if its q/k/v are not identically-shaped INT8 (TensorWiseINT8Layout) weights,
-if a LoRA/patch targets any of them, or if it is already fused. q_proj/k_proj/
+if its q/k/v are not identically-shaped, identically-parameterized weights
+all in the same supported layout (TensorWiseINT8Layout or
+TensorCoreConvRotW4A4Layout), if a LoRA/patch targets any of them, or if it
+is already fused. q_proj/k_proj/
 v_proj stay registered on the replacement (unused by the fused compute_qkv)
 so whole-model device moves keep them in lockstep with the rest of the block;
 as a result a fused model's state_dict emits qkv_proj.* keys ALONGSIDE the
@@ -48,6 +50,15 @@ _HOOK_CONTAINER_NAMES = (
 )
 
 
+_INT8_LAYOUT = "TensorWiseINT8Layout"
+_W4A4_LAYOUT = "TensorCoreConvRotW4A4Layout"
+_SUPPORTED_LAYOUTS = (_INT8_LAYOUT, _W4A4_LAYOUT)
+
+# Params fields (besides scale/orig_shape, checked separately) that must match
+# across q/k/v for TensorWiseINT8Layout.
+_INT8_PARAM_MATCH_FIELDS = ("convrot", "convrot_groupsize", "orig_dtype", "is_weight", "transposed")
+
+
 def _patch_key(block_idx):
     return f"diffusion_model.blocks.{block_idx}.self_attn"
 
@@ -77,9 +88,12 @@ def _build_fused_linear(q_proj, k_proj, v_proj):
     q_out, k_out, v_out = q_proj.out_features, k_proj.out_features, v_proj.out_features
     in_features = q_proj.in_features
     out_features = q_out + k_out + v_out
+    layout = q_w._layout_cls
 
     # Row order [q; k; v] -> GEMM output columns follow the same order, so a
     # plain chunk(3, dim=-1) on the fused output recovers q, k, v exactly.
+    # Exact for w4a4 too: int4 packing runs along K (columns), two values per
+    # byte, so concatenating whole output rows (dim 0) never splits a nibble pair.
     fused_qdata = torch.cat([q_w._qdata, k_w._qdata, v_w._qdata], dim=0)
     fused_scale = torch.cat(
         [
@@ -89,6 +103,11 @@ def _build_fused_linear(q_proj, k_proj, v_proj):
         ],
         dim=0,
     )
+    if layout == _W4A4_LAYOUT:
+        # w4a4's GEMM validates wscales as exactly 1D -- this layout is always
+        # row-wise (never per-tensor), unlike int8's kernel below, which
+        # tolerates (and this fusion otherwise keeps) the (out_features, 1) shape.
+        fused_scale = fused_scale.reshape(out_features)
 
     has_bias = q_proj.bias is not None
     fused_cls = type(q_proj)
@@ -224,8 +243,11 @@ def _check_eligible(attn):
             return False, f"self_attn.{name} missing or not a quantized Linear"
 
     q_w, k_w, v_w = q_proj.weight, k_proj.weight, v_proj.weight
-    if not (q_w._layout_cls == k_w._layout_cls == v_w._layout_cls == "TensorWiseINT8Layout"):
-        return False, "not a matching TensorWiseINT8Layout weight on q/k/v"
+    layout = q_w._layout_cls
+    if not (layout == k_w._layout_cls == v_w._layout_cls):
+        return False, "mismatched layout across q/k/v"
+    if layout not in _SUPPORTED_LAYOUTS:
+        return False, f"unsupported layout for fusion: {layout}"
 
     if not (q_proj.in_features == k_proj.in_features == v_proj.in_features):
         return False, "mismatched in_features across q/k/v"
@@ -250,7 +272,13 @@ def _check_eligible(attn):
         return False, "bias present on some but not all of q/k/v"
 
     q_p, k_p, v_p = q_w._params, k_w._params, v_w._params
-    for field in ("convrot", "convrot_groupsize", "orig_dtype", "is_weight", "transposed"):
+    if layout == _INT8_LAYOUT:
+        match_fields = _INT8_PARAM_MATCH_FIELDS
+    else:
+        # TensorCoreConvRotW4A4Layout: every Params field except the per-row
+        # scale and orig_shape, both of which legitimately differ with out_features.
+        match_fields = tuple(f.name for f in dataclasses.fields(q_p) if f.name not in ("scale", "orig_shape"))
+    for field in match_fields:
         qf, kf, vf = getattr(q_p, field, None), getattr(k_p, field, None), getattr(v_p, field, None)
         if not (qf == kf == vf):
             return False, f"mismatched weight param '{field}' across q/k/v"
@@ -391,5 +419,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AnimaFuseQKV": "Anima Fuse Self-Attn QKV (int8)",
+    "AnimaFuseQKV": "Anima Fuse Self-Attn QKV",
 }
