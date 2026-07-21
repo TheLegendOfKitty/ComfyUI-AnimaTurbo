@@ -12,6 +12,7 @@ import logging
 from . import sage_pv_fp16_patch  # noqa: F401  self-applies: sageattn -> CUDA pv=fp16 dispatch
 from . import int8_shared_quant_patch  # noqa: F401  self-applies: dedupes q/k/v activation quantize (plain int8)
 from . import int8_convrot_shared_quant_patch  # noqa: F401  self-applies: dedupes q/k/v activation quantize (convrot)
+from . import w4a4_compile_patch  # noqa: F401  self-applies: makes ConvRot W4A4 Linear torch.compile-safe
 from . import warp_fht  # noqa: F401  self-applies: JIT-builds standalone kernel + installs _C shim
 
 try:

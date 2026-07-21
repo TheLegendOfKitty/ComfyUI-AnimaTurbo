@@ -33,6 +33,16 @@ shim, so the whole pack works against a stock comfy-kitchen install.
   eligible calls (`group_size=256`, non-stochastic, `K % 1024 == 0`,
   `1024 <= K <= 32768`, dtype fp32/fp16/bf16) to it. Ineligible calls, and any
   build/install failure, fall through to comfy-kitchen's own handler unchanged.
+- **w4a4_compile_patch.py** (auto-applies): makes ConvRot W4A4 (int4) Linears
+  `torch.compile`-safe. Stock comfy-kitchen dispatches those Linears through
+  raw CUDA-extension calls with no `torch.library` registration, so dynamo
+  can't fake-tensor them and `TorchCompileModel` hard-crashes on a
+  `w4a4convrot` checkpoint. This registers
+  `anima_turbo::convrot_w4a4_linear` as a proper custom op (with a fake
+  kernel for shape/dtype inference) wrapping the exact same underlying
+  computation, and repoints the layout's `linear`/`mm`/`addmm` dispatch
+  entries to route through it. No effect on `allint8`/`int8convrot`
+  checkpoints (they don't use this layout) or on eager inference.
 
 ## Install
 
@@ -82,10 +92,24 @@ superseded `convrot_fht_triton_patch.py` and `anima_bf16_residual_patch.py`
 files, if present in `custom_nodes/`, were excluded so the numbers reflect this
 pack alone.
 
+For `anima-base-v1.0-w4a4convrot.safetensors` (same config, `TorchCompileModel`
++ `w4a4_compile_patch.py`, no other patches applicable to this checkpoint):
+
+| Measurement | Value | Config |
+|---|---|---|
+| Eager (no TorchCompileModel) | 0.6364 s/it | steady-state, last 20 of 30 steps |
+| Compiled (with `w4a4_compile_patch.py`) | **0.5880 s/it** | steady-state, last 20 of 30 steps |
+| Remaining graph breaks | 4 distinct reasons, 26 occurrences, **none in the ConvRot W4A4 linear/mm/addmm path** | `torch._dynamo.utils.counters`; all from SageAttention's pybind kernels and a `torch.cuda.set_device` dynamo skip-list entry, pre-existing and unrelated to this patch |
+| Peak VRAM (torch allocator) | 3567.8 MiB eager -> 3423.9 MiB compiled | 30 steps |
+
 ## Env kill-switches
 
 - `ANIMA_TURBO_NO_KERNEL=1` — skips the `warp_fht` kernel build and shim install
   entirely (this pack's own switch). Everything else in the pack still applies.
+- `ANIMA_TURBO_NO_W4A4_COMPILE=1` — skips `w4a4_compile_patch.py` entirely
+  (this pack's own switch). ConvRot W4A4 checkpoints fall back to stock
+  comfy-kitchen dispatch — fine for eager, but `TorchCompileModel` will hit
+  the FakeTensor crash again.
 - `COMFY_KITCHEN_DISABLE_CUTLASS=1` — comfy-kitchen's own switch (not defined by
   this pack). Both shared-quant-cache patches respect it per-call: with it set,
   their fast paths never engage and every call falls through to whatever handler
