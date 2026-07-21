@@ -1,20 +1,22 @@
 """
 JIT-builds a standalone CUDA extension (convrot_warp_quantize.cu) that reproduces
-comfy-kitchen's warp-per-group FHT ConvRot row-wise INT8 and INT4 quantize kernels,
-then installs shims over comfy_kitchen.backends.cuda._C.quantize_int8_rowwise_convrot64
+comfy-kitchen's warp-per-group FHT ConvRot row-wise INT8 and INT4 quantize kernels
+(the latter in two variants: a scalar-native one covering fp32/fp16/bf16, and a
+half2/bf162 SIMD-paired one, fp16/bf16 only, that beats the scalar one wherever both
+apply), then installs shims over comfy_kitchen.backends.cuda._C.quantize_int8_rowwise_convrot64
 and .quantize_int4_rowwise_convrot64 that route eligible calls to it. Ineligible calls,
 and any failure at build or install time, fall through to comfy-kitchen's own stock
 behavior unchanged -- this module either speeds up an eligible subset of calls or is a
 complete no-op, never a correctness risk. Both shims share eligibility and capsule-
-lifecycle handling (_make_shim); only the underlying kernel entry point differs.
+lifecycle handling (_make_shim); only the underlying kernel entry point(s) differ.
 
 Shared eligibility (must match every condition; anything else delegates to the original
 _C entry point unchanged): group_size == 256, stochastic is False, input is a 2D CUDA
 tensor with dtype in {float32, float16, bfloat16}, and K % 1024 == 0 with
 1024 <= K <= 32768. The int8 shim uses exactly this. The int4 shim ANDs in a narrower,
-microbenchmark-derived K band (see _INT4_MIN_WIN_K/_INT4_MAX_WIN_K below) -- outside
-that band the standalone kernel measured slower than stock, so those calls correctly
-keep delegating.
+microbenchmark-derived per-dtype K eligibility (see _int4_route below) and picks
+between the h2 and scalar-native kernels per call -- outside every measured win the
+call correctly keeps delegating to stock.
 
 Env kill-switch: ANIMA_TURBO_NO_KERNEL=1 skips the build and shim install entirely.
 """
@@ -222,23 +224,53 @@ def _install_shim(ext):
     )
 
 
-# Microbenchmarked (bf16, RTX 3090, K%1024==0 grid, idle GPU, >=50 iters): the warp
-# kernel beats stock only where stock's OWN dispatch already uses its less-efficient
-# block_threads_multi path (K>4096, K!=15360) -- at K<=4096 stock's dedicated
-# block_threads_small path is already faster than the warp kernel (0.85-1.00x here,
-# a regression at K=2048/3072/4096 specifically), and at K>=14336 the warp kernel's
-# own register pressure (74 regs/thread for fp16/bf16, no half2 packing) drops
-# occupancy enough to lose again (0.58-0.89x, worst at K=15360 where stock has its
-# own dedicated fast PACK4 path). [5120, 12288] is the validated win band (1.12x-1.89x
-# at tested points 5120/6144/8192/9216/10240/12288); this does not include the most
-# frequent real shape in this model's w4a4 workload (K=2048), which correctly keeps
-# delegating to stock unchanged.
+# Microbenchmarked (bf16, RTX 3090, K%1024==0 grid, idle GPU, >=50 iters): the SCALAR
+# warp kernel (convrot_warp_quantize_int4) beats stock only where stock's OWN dispatch
+# already uses its less-efficient block_threads_multi path (K>4096, K!=15360) -- at
+# K<=4096 stock's dedicated block_threads_small path is already faster than the warp
+# kernel (0.85-1.00x here, a regression at K=2048/3072/4096 specifically), and at
+# K>=14336 the warp kernel's own register pressure (74 regs/thread for fp16/bf16, no
+# half2 packing) drops occupancy enough to lose again (0.58-0.89x, worst at K=15360
+# where stock has its own dedicated fast PACK4 path). [5120, 12288] is the validated
+# scalar win band (1.12x-1.89x at tested points 5120/6144/8192/9216/10240/12288).
 _INT4_MIN_WIN_K = 5120
 _INT4_MAX_WIN_K = 12288
 
 
-def _int4_extra_eligible(x):
-    return _INT4_MIN_WIN_K <= x.shape[1] <= _INT4_MAX_WIN_K
+# Microbenchmarked (bf16/fp16, RTX 3090, idle GPU, >=100 iters): the half2/bf162
+# SIMD-paired kernel (convrot_warp_quantize_int4_h2) beats BOTH stock and the scalar
+# warp kernel at every K it can reach -- K==1024 or K%2048==0, 1024<=K<=32768 (its
+# even-group-count pairing needs K%512==0; the concrete warp width used here only
+# divides cleanly at 1024 or multiples of 2048, see the kernel-side comment) -- with
+# no upper-K falloff like the scalar kernel's: 1.24x-2.38x vs stock and 1.36x-1.96x
+# vs scalar, measured at K in {1024,2048,4096,6144,8192,10240,12288,16384,24576,32768}.
+# For fp16/bf16, h2 takes precedence wherever it applies; the scalar band below
+# covers everything else in [5120, 12288], including all fp32 calls.
+def _int4_h2_eligible_k(k):
+    return k == 1024 or k % 2048 == 0
+
+
+# Scalar eligibility is the full [_INT4_MIN_WIN_K, _INT4_MAX_WIN_K] band for every
+# dtype, with no h2-K exclusion: _int4_route tries h2 first and returns before
+# reaching this check whenever h2 actually applies (fp16/bf16 at an h2-eligible K),
+# so this band is reached only when h2 doesn't apply -- fp32 at any K in the band, or
+# fp16/bf16 at a K in the band that h2 can't reach (5120/7168/9216/11264).
+def _int4_scalar_eligible_k(k):
+    return _INT4_MIN_WIN_K <= k <= _INT4_MAX_WIN_K
+
+
+def _int4_route(ext, x):
+    """Picks the extension entry point for this call's dtype/K, or None to delegate
+    to stock (K outside every measured win). h2 first: it dominates wherever both it
+    and the scalar kernel are eligible (see the win-band comments above)."""
+    import torch
+
+    k = x.shape[1]
+    if x.dtype in (torch.float16, torch.bfloat16) and _int4_h2_eligible_k(k):
+        return ext.convrot_warp_quantize_int4_h2
+    if _int4_scalar_eligible_k(k):
+        return ext.convrot_warp_quantize_int4
+    return None
 
 
 def _install_int4_shim(ext):
@@ -261,18 +293,25 @@ def _install_int4_shim(ext):
     if wrap_for_dlpack is None:
         wrap_for_dlpack = _default_wrap_for_dlpack
 
+    def extra_eligible(x):
+        return _int4_route(ext, x) is not None
+
+    def kernel_call(x, q, s, stream_ptr):
+        _int4_route(ext, x)(x, q, s, stream_ptr)
+
     shim = _make_shim(
         c_module, "quantize_int4_rowwise_convrot64", orig, wrap_for_dlpack,
-        lambda x, q, s, stream_ptr: ext.convrot_warp_quantize_int4(x, q, s, stream_ptr),
-        extra_eligible=_int4_extra_eligible,
+        kernel_call,
+        extra_eligible=extra_eligible,
     )
     setattr(c_module, "quantize_int4_rowwise_convrot64", shim)
     logging.info(
         f"{_LOG_PREFIX} installed: quantize_int4_rowwise_convrot64 calls with group_size=256, "
-        f"non-stochastic, K%1024==0, {_INT4_MIN_WIN_K}<=K<={_INT4_MAX_WIN_K}, dtype in {{fp32,fp16,bf16}} "
-        f"now route to the standalone warp-FHT extension (narrower than the general K range: "
-        f"outside this band the warp kernel measured slower than stock); all other calls fall "
-        f"through to comfy-kitchen's own handler unchanged."
+        f"non-stochastic, K%1024==0, dtype in {{fp32,fp16,bf16}} now route per-call to whichever "
+        f"of the standalone extension's kernels was measured fastest for that dtype/K (h2 for "
+        f"fp16/bf16 with K==1024 or K%2048==0; scalar-native for K in [{_INT4_MIN_WIN_K}, "
+        f"{_INT4_MAX_WIN_K}] outside that; stock otherwise); all other calls fall through to "
+        f"comfy-kitchen's own handler unchanged."
     )
 
 
